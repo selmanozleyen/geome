@@ -17,18 +17,20 @@ __all__ = ["TileLoader", "write_sorted"]
 Rep = LayerAcc | MultiAcc  # a whole array: A.X, A.layers[k] or A.obsm[k]
 
 
-def _read_rows(x, rows: np.ndarray) -> np.ndarray:
-    """Dense float32 rows ``rows`` (ascending) of ``x``, reading each run of consecutive rows as one slice.
+def _read_rows(x, rows: np.ndarray, max_gap: int = 4096) -> np.ndarray:
+    """Dense float32 rows ``rows`` (ascending) of ``x``, in as few contiguous slices as possible.
 
-    Works the same for a backed zarr array or ``CSRDataset`` and for in-memory arrays. On a spatially sorted store a
-    tile is one long run and its neighbour margin a few short ones.
+    Runs closer than ``max_gap`` rows are read as one slice and the rows between them dropped, so a tile's margin,
+    scattered over many short runs near the tile on a spatially sorted store, costs a few large reads instead of one
+    small read per run. Works the same for a backed zarr array or ``CSRDataset`` and for in-memory arrays.
     """
-    runs = np.split(rows, np.flatnonzero(np.diff(rows) != 1) + 1)
+    starts = np.flatnonzero(np.diff(rows) > max_gap) + 1
     parts = []
-    for run in runs:
-        sub = x[int(run[0]) : int(run[-1]) + 1]
+    for block in np.split(rows, starts):
+        lo, hi = int(block[0]), int(block[-1]) + 1
+        sub = x[lo:hi]
         sub = sub.toarray() if hasattr(sub, "toarray") else np.asarray(sub)
-        parts.append(sub.astype(np.float32, copy=False))
+        parts.append(sub[block - lo].astype(np.float32, copy=False))
     return np.concatenate(parts, axis=0)
 
 
@@ -111,6 +113,7 @@ class TileLoader:
         self.n_obs = coords.shape[0]
         self._x = rep.get(adata)
         self._shuffle = shuffle
+        self._structures: dict[int, dict[str, torch.Tensor]] = {}
         self._rng = np.random.default_rng(seed)
 
     @classmethod
@@ -137,16 +140,22 @@ class TileLoader:
         for i in order:
             yield self.tile(i)
 
+    def _structure(self, i: int) -> dict[str, torch.Tensor]:
+        """Tile ``i``'s rows, edges and core mask; built once, then kept (about the size of the graph in total)."""
+        if i not in self._structures:
+            core = self.tiles[i]
+            rows = expand(self.graph, core, self.n_hops)
+            sub = self.graph[rows][:, rows].tocoo()
+            self._structures[i] = {
+                # PyG edges point source -> target; the graph is symmetric, so col -> row is the same set.
+                "edge_index": torch.from_numpy(np.stack([sub.col, sub.row]).astype(np.int64)),
+                "edge_weight": torch.from_numpy(sub.data),
+                "core_mask": torch.from_numpy(np.isin(rows, core)),
+                "rows": torch.from_numpy(rows),
+            }
+        return self._structures[i]
+
     def tile(self, i: int) -> Data:
         """Tile ``i`` with its margin: ``x``, ``edge_index``, ``edge_weight``, ``core_mask`` and global ``rows``."""
-        core = self.tiles[i]
-        rows = expand(self.graph, core, self.n_hops)
-        sub = self.graph[rows][:, rows].tocoo()
-        return Data(
-            x=torch.from_numpy(_read_rows(self._x, rows)),
-            # PyG edges point source -> target; the graph is symmetric, so col -> row is the same set.
-            edge_index=torch.from_numpy(np.stack([sub.col, sub.row]).astype(np.int64)),
-            edge_weight=torch.from_numpy(sub.data),
-            core_mask=torch.from_numpy(np.isin(rows, core)),
-            rows=torch.from_numpy(rows),
-        )
+        s = self._structure(i)
+        return Data(x=torch.from_numpy(_read_rows(self._x, s["rows"].numpy())), **s)
