@@ -30,7 +30,7 @@ import torch
 from scipy import sparse
 from torch_geometric.nn import GCNConv
 
-from geome.tiles import TileLoader, spatial_graph, write_sorted
+from geome.tiles import TileLoader, morton_order, spatial_graph
 
 
 def peak_rss_gb() -> float:
@@ -47,13 +47,20 @@ def make(args) -> None:
 
     domain = KDTree(centers).query(coords, workers=-1)[1]
     programs = rng.gamma(0.5, 2.0, size=(args.n_domains, args.n_genes)).astype(np.float32)
-    counts = rng.poisson(programs[domain]).astype(np.float32)
-    adata = ad.AnnData(
-        X=sparse.csr_matrix(counts),
-        obs={"domain": domain.astype(str)},
-        obsm={"spatial": coords},
+    # sorted along the Z-order curve first, then counts drawn in chunks: peak memory is the sparse matrix, not a
+    # dense n_cells x n_genes array (which alone would be 9.6 GB at 8M cells)
+    order = morton_order(coords)
+    coords, domain = coords[order], domain[order]
+    chunk = 250_000
+    counts = sparse.vstack(
+        [
+            sparse.csr_matrix(rng.poisson(programs[domain[i : i + chunk]]).astype(np.float32))
+            for i in range(0, args.n_cells, chunk)
+        ],
+        format="csr",
     )
-    write_sorted(adata, args.path)
+    adata = ad.AnnData(X=counts, obs={"domain": domain.astype(str)}, obsm={"spatial": coords})
+    adata.write_zarr(args.path)
     print(json.dumps({"made": str(args.path), "n_cells": args.n_cells, "n_genes": args.n_genes}))
 
 
