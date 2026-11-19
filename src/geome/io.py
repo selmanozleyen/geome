@@ -1,4 +1,4 @@
-"""Rewrite a store with its cells grouped by obs categories, out of core."""
+"""Rewrite a store with its cells in a new order, out of core."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from anndata.acc import A, LayerAcc, MultiAcc
 from scipy import sparse
 from zarr.codecs import BloscCodec
 
-__all__ = ["write_grouped"]
+__all__ = ["write_permuted"]
 
 Rep = LayerAcc | MultiAcc
 
@@ -45,7 +45,7 @@ def _read(x, rows: np.ndarray, max_gap: int):
     return out[back]
 
 
-def _copy_sparse(x, group: zarr.Group, name: str, order: np.ndarray, chunk_rows: int, shard_bytes: int, gap: int):
+def _copy_sparse(x, group, name, order, chunk_rows: int, shard_bytes: int, gap: int, batch_size: int | None):
     indptr = np.asarray(x.group["indptr"][:], dtype=np.int64)
     new_indptr = np.concatenate([[0], np.cumsum(np.diff(indptr)[order])])
     nnz, (n, m) = int(new_indptr[-1]), x.shape
@@ -62,7 +62,7 @@ def _copy_sparse(x, group: zarr.Group, name: str, order: np.ndarray, chunk_rows:
     g.create_array("indptr", data=new_indptr)
     # ponytail: blocks end on row boundaries, not shard boundaries, so each block rewrites at most two partial
     # shards; align blocks to shards if that shows up in the write time
-    block = max(1, (arrays["data"].shards[0]) // per_row)
+    block = batch_size or max(1, arrays["data"].shards[0] // per_row)
     for a in range(0, n, block):
         b = min(n, a + block)
         sub = _read(x, order[a:b], gap)
@@ -71,7 +71,7 @@ def _copy_sparse(x, group: zarr.Group, name: str, order: np.ndarray, chunk_rows:
         arrays["indices"][s:e] = sub.indices
 
 
-def _copy_dense(x, group: zarr.Group, name: str, order: np.ndarray, chunk_rows: int, shard_bytes: int, gap: int):
+def _copy_dense(x, group, name, order, chunk_rows: int, shard_bytes: int, gap: int, batch_size: int | None):
     n, rest = x.shape[0], tuple(x.shape[1:])
     row_bytes = max(1, int(np.prod(rest, dtype=np.int64)) * np.dtype(x.dtype).itemsize)
     chunk = min(chunk_rows, max(n, 1))
@@ -79,34 +79,38 @@ def _copy_dense(x, group: zarr.Group, name: str, order: np.ndarray, chunk_rows: 
     out = group.create_array(name, shape=x.shape, dtype=x.dtype, chunks=(chunk, *rest), shards=(shard, *rest),
                              compressors=(BloscCodec(cname="lz4", clevel=3, shuffle="shuffle"),))  # fmt: skip
     out.attrs.update({"encoding-type": "array", "encoding-version": "0.2.0"})
-    for a in range(0, n, shard):
-        out[a : a + shard] = _read(x, order[a : a + shard], gap)
+    block = batch_size or shard
+    for a in range(0, n, block):
+        out[a : a + block] = _read(x, order[a : a + block], gap)
 
 
-def write_grouped(
+def write_permuted(
     src: str | os.PathLike,
     out: str | os.PathLike,
-    groupby: Sequence[str],
+    order: np.ndarray,
     reps: Sequence[Rep] = (A.X,),
     *,
+    batch_size: int | None = None,
     n_obs_per_chunk: int = 64,
     shard_bytes: int = 2**30,
     max_gap: int = 4096,
-) -> np.ndarray:
-    """Copy the zarr store ``src`` to ``out`` with its cells stably sorted by the ``obs`` columns ``groupby``.
+) -> None:
+    """Copy the zarr store ``src`` to ``out`` with row ``i`` of ``out`` being row ``order[i]`` of ``src``.
 
-    ``obs`` and ``var`` are read into memory; the ``reps`` are opened with :func:`scfit.data.open_adata` and streamed in
-    shard-sized blocks of rows, so memory holds about one shard. Within a group cells keep their order, and ``obs_names``
-    are kept, so results can be mapped back to the source. ``out`` is zarr v3, sharded and chunked like annbatch's
-    ``write_sharded`` (``n_obs_per_chunk`` rows per chunk). Returns the order: row ``i`` of ``out`` is row
-    ``order[i]`` of ``src``.
+    Any order: grouped by obs columns (``obs.sort_values(cols, kind="stable")``), spatial (``morton_order``) or shuffled.
+    ``obs`` and ``var`` are read into memory and reordered; the ``reps`` are opened with :func:`scfit.data.open_adata`
+    and streamed ``batch_size`` rows at a time (default: about one shard), each batch read as a few large slices, so
+    memory holds about one batch. How fast that is depends on the order: a batch's rows close together in ``src`` read
+    as few slices, a shuffled order reads row by row. ``obs_names`` are kept, so results map back to ``src``. ``out`` is
+    zarr v3, sharded and chunked like annbatch's ``write_sharded`` (``n_obs_per_chunk`` rows per chunk).
     """
     from scfit.data import open_adata
 
-    groupby = list(groupby)
+    order = np.asarray(order)
     g = zarr.open_group(src, mode="r")
     obs, var = ad.io.read_elem(g["obs"]), ad.io.read_elem(g["var"])
-    order = obs[groupby].reset_index(drop=True).sort_values(groupby, kind="stable").index.to_numpy()
+    if not np.array_equal(np.sort(order), np.arange(len(obs))):
+        raise ValueError("`order` must be a permutation of the rows of `src`.")
     backed = open_adata(src, *reps)
 
     with ad.settings.override(zarr_write_format=3):
@@ -117,5 +121,4 @@ def write_grouped(
         group = root if parent is None else root[parent]
         x = ref.get(backed)
         copy = _copy_sparse if hasattr(x, "group") and "indptr" in x.group else _copy_dense
-        copy(x, group, name, order, n_obs_per_chunk, shard_bytes, max_gap)
-    return order
+        copy(x, group, name, order, n_obs_per_chunk, shard_bytes, max_gap, batch_size)

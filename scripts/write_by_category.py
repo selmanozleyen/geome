@@ -5,7 +5,7 @@
 
 Modes:
 
-- ``custom``: :func:`geome.io.write_grouped`: ``obs`` read eagerly, arrays opened with :func:`scfit.data.open_adata` and
+- ``custom``: :func:`geome.io.write_permuted` with the grouped order: ``obs`` read eagerly, arrays opened with :func:`scfit.data.open_adata` and
   streamed into place in shard-sized blocks, in one global stable order by ``--groupby``.
 - ``lazy``: :func:`anndata.experimental.read_lazy` (dask), the same order, then :func:`annbatch.io.write_sharded` on the
   lazy, reordered view: the dask baseline.
@@ -54,9 +54,11 @@ def write_lazy(src: str, out: str, groupby: list[str], args) -> ad.AnnData:
 def write_custom(src: str, out: str, groupby: list[str], args) -> None:
     from anndata.acc import A
 
-    from geome.io import write_grouped
+    from geome.io import write_permuted
 
-    write_grouped(src, out, groupby, reps=(A.X, A.obsm["spatial"]), n_obs_per_chunk=args.n_obs_per_chunk)
+    obs = ad.io.read_elem(zarr.open_group(src, mode="r")["obs"])
+    reps = (A.X, A.obsm["spatial"])
+    write_permuted(src, out, stable_order(obs, groupby), reps=reps, n_obs_per_chunk=args.n_obs_per_chunk)
 
 
 def check(src: str, out: str, groupby: list[str]) -> dict:

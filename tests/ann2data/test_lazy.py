@@ -59,26 +59,29 @@ def test_rows_restrict_like_subsetting():
     _assert_same(eager, ann2data.LazyCategoryData(adata, _a2d(), rows=train))
 
 
-def test_write_grouped_matches_an_in_memory_reorder(tmp_path):
+@pytest.mark.parametrize("kind", ["grouped", "shuffled"])
+def test_write_permuted_matches_an_in_memory_reorder(tmp_path, kind):
     pytest.importorskip("scfit.data")
     from anndata.acc import A
 
-    from geome.io import write_grouped
+    from geome.io import write_permuted
 
     adata = _adata(n=500)
     adata.layers["dense"] = adata.X.toarray()
     adata.write_zarr(tmp_path / "src.zarr")
-    order = write_grouped(
+    codes = adata.obs["sample"].cat.codes.to_numpy()
+    order = np.argsort(codes, kind="stable") if kind == "grouped" else np.random.default_rng(0).permutation(500)
+    write_permuted(
         tmp_path / "src.zarr",
         tmp_path / "out.zarr",
-        groupby=["sample"],
+        order,
         reps=(A.X, A.layers["dense"], A.obsm["spatial"]),
+        batch_size=37,  # many batches, not aligned to anything
         n_obs_per_chunk=16,
-        shard_bytes=2_000,  # many small shards and blocks
+        shard_bytes=2_000,
     )
-    want = adata[np.argsort(adata.obs["sample"].cat.codes.to_numpy(), kind="stable")]
+    want = adata[order]
     got = ad.read_zarr(tmp_path / "out.zarr")
-    np.testing.assert_array_equal(order, np.argsort(adata.obs["sample"].cat.codes.to_numpy(), kind="stable"))
     assert list(got.obs_names) == list(want.obs_names)
     np.testing.assert_array_equal(got.X.toarray(), want.X.toarray())
     np.testing.assert_array_equal(got.layers["dense"], want.layers["dense"])
