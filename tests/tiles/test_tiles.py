@@ -112,3 +112,23 @@ def test_backed_store_matches_in_memory(tmp_path):
     for a, b in zip(on_disk, in_mem, strict=True):
         torch.testing.assert_close(a.x, b.x)
         torch.testing.assert_close(a.edge_index, b.edge_index)
+
+
+def test_groups_split_tiles_and_graph():
+    from anndata.acc import A
+
+    adata = _slide()
+    adata.obs["sample"] = np.where(np.arange(adata.n_obs) % 3 == 0, "a", "b")
+    loader = TileLoader(adata, groups=[A.obs["sample"]], tile_size=200, shuffle=False)
+    sample = adata.obs["sample"].to_numpy()
+    for core, (key,) in zip(loader.tiles, loader.tile_groups, strict=True):
+        assert set(sample[core]) == {key}
+    rows, cols = loader.graph.nonzero()
+    assert (sample[rows] == sample[cols]).all()
+
+
+def test_custom_graph_is_used():
+    adata = _slide(n=300)
+    ring = sparse.diags_array([np.ones(299), np.ones(299)], offsets=[1, -1], shape=(300, 300))
+    loader = TileLoader(adata, graph=ring, tile_size=100, shuffle=False)
+    assert loader.graph.nnz == ring.nnz + 300  # the ring plus self-loops

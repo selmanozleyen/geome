@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 
 import anndata as ad
 import numpy as np
+import pandas as pd
 import torch
-from anndata.acc import A, LayerAcc, MultiAcc
+from anndata.acc import A, AdRef, LayerAcc, MultiAcc
 from torch_geometric.data import Data
 
-from ._graph import expand, morton_order, spatial_graph
+from ._graph import expand, gcn_normalize, morton_order, spatial_graph
 
 __all__ = ["TileLoader", "write_sorted"]
 
@@ -60,6 +61,12 @@ class TileLoader:
         Features per cell, as an :mod:`anndata.acc` reference: ``A.X``, ``A.layers[k]`` or ``A.obsm[k]``.
     spatial
         Coordinates, as an :mod:`anndata.acc` reference.
+    groups
+        ``obs`` columns, as :mod:`anndata.acc` references (``A.obs["sample"]``). Tiles never mix cells of different
+        value combinations, and the default kNN graph has no edges between them. ``tile_groups`` holds each tile's.
+    graph
+        An adjacency to use instead of the kNN graph, e.g. ``adata.obsp["spatial_connectivities"]``. It is binarized,
+        given self-loops and normalized like a GCN.
     n_neighbors
         Neighbours per cell in the kNN graph, before symmetrizing.
     n_hops
@@ -78,6 +85,8 @@ class TileLoader:
         *,
         rep: Rep = A.X,
         spatial: Rep = A.obsm["spatial"],
+        groups: Sequence[AdRef] = (),
+        graph=None,
         n_neighbors: int = 6,
         n_hops: int = 2,
         tile_size: int = 50_000,
@@ -85,9 +94,19 @@ class TileLoader:
         seed: int = 0,
     ) -> None:
         coords = np.asarray(spatial.get(adata)[:])
-        self.graph = spatial_graph(coords, n_neighbors)
-        order = morton_order(coords)
-        self.tiles = [np.sort(order[i : i + tile_size]) for i in range(0, coords.shape[0], tile_size)]
+        if groups:
+            keys = pd.MultiIndex.from_arrays([np.asarray(ref.acc.get(adata, ref.idx)) for ref in groups])
+            codes, uniques = pd.factorize(keys)
+        else:
+            codes, uniques = np.zeros(coords.shape[0], dtype=np.int64), [()]
+        self.graph = gcn_normalize(graph) if graph is not None else spatial_graph(coords, n_neighbors, codes)
+        self.tiles, self.tile_groups = [], []
+        for g, key in enumerate(uniques):
+            idx = np.flatnonzero(codes == g)
+            order = idx[morton_order(coords[idx])]
+            for i in range(0, order.size, tile_size):
+                self.tiles.append(np.sort(order[i : i + tile_size]))
+                self.tile_groups.append(key)
         self.n_hops = n_hops
         self.n_obs = coords.shape[0]
         self._x = rep.get(adata)
@@ -96,12 +115,19 @@ class TileLoader:
 
     @classmethod
     def from_path(
-        cls, path: str | os.PathLike, *, rep: Rep = A.X, spatial: Rep = A.obsm["spatial"], **kwargs
+        cls,
+        path: str | os.PathLike,
+        *,
+        rep: Rep = A.X,
+        spatial: Rep = A.obsm["spatial"],
+        groups: Sequence[AdRef] = (),
+        **kwargs,
     ) -> TileLoader:
-        """Open a zarr store backed with :func:`scfit.data.open_adata`, reading only ``rep`` and ``spatial``."""
+        """Open a zarr store backed with :func:`scfit.data.open_adata`, reading only the referenced parts."""
         from scfit.data import open_adata
 
-        return cls(open_adata(path, rep, spatial), rep=rep, spatial=spatial, **kwargs)
+        adata = open_adata(path, rep, spatial, *groups)
+        return cls(adata, rep=rep, spatial=spatial, groups=groups, **kwargs)
 
     def __len__(self) -> int:
         return len(self.tiles)
