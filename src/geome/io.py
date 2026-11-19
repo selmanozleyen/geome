@@ -26,9 +26,20 @@ def _path(ref: Rep) -> tuple[str | None, str]:
     raise ValueError(f"{ref!r} is not A.X, A.layers[k] or A.obsm[k].")
 
 
-def _runs(rows: np.ndarray, max_gap: int) -> list[np.ndarray]:
-    """``rows`` (ascending) split where consecutive rows are more than ``max_gap`` apart."""
-    return np.split(rows, np.flatnonzero(np.diff(rows) > max_gap) + 1)
+def _runs(rows: np.ndarray, max_gap: int, min_density: float = 0.25) -> list[np.ndarray]:
+    """``rows`` (ascending) as runs to read one slice each.
+
+    Rows less than ``max_gap`` apart share a slice, unless that slice would mostly read rows nobody asked for (fewer
+    than ``min_density`` of its rows wanted): such a run falls back to its exactly consecutive pieces. Without that,
+    a scattered (e.g. shuffled) batch merges into one slice spanning nearly the whole store.
+    """
+    out = []
+    for run in np.split(rows, np.flatnonzero(np.diff(rows) > max_gap) + 1):
+        if run.size / (int(run[-1]) - int(run[0]) + 1) >= min_density:
+            out.append(run)
+        else:
+            out.extend(np.split(run, np.flatnonzero(np.diff(run) > 1) + 1))
+    return out
 
 
 def _read(x, rows: np.ndarray, max_gap: int):
@@ -94,15 +105,16 @@ def write_permuted(
     *,
     batch_size: int | None = None,
     n_obs_per_chunk: int = 64,
-    shard_bytes: int = 2**30,
+    shard_bytes: int = 2**28,
     max_gap: int = 4096,
 ) -> None:
     """Copy the zarr store ``src`` to ``out`` with row ``i`` of ``out`` being row ``order[i]`` of ``src``.
 
     Any order: grouped by obs columns (``obs.sort_values(cols, kind="stable")``), spatial (``morton_order``) or shuffled.
     ``obs`` and ``var`` are read into memory and reordered; the ``reps`` are opened with :func:`scfit.data.open_adata`
-    and streamed ``batch_size`` rows at a time (default: about one shard), each batch read as a few large slices, so
-    memory holds about one batch. How fast that is depends on the order: a batch's rows close together in ``src`` read
+    and streamed ``batch_size`` rows at a time (default: one shard, ``shard_bytes`` of ``data``, so each batch fills
+    whole shards instead of rewriting a shard per batch), each batch read as a few large slices, so memory holds about
+    one batch. How fast that is depends on the order: a batch's rows close together in ``src`` read
     as few slices, a shuffled order reads row by row. ``obs_names`` are kept, so results map back to ``src``. ``out`` is
     zarr v3, sharded and chunked like annbatch's ``write_sharded`` (``n_obs_per_chunk`` rows per chunk).
     """

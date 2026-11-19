@@ -71,6 +71,12 @@ def check(src: str, out: str, groupby: list[str]) -> dict:
 
 
 def main() -> None:
+    try:  # annbatch's recommendation for local disks: zarrs' Rust codec pipeline
+        import zarrs  # noqa: F401
+
+        zarr.config.set({"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"})
+    except ImportError:
+        pass
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("src")
     p.add_argument("out")
