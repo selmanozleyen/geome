@@ -57,3 +57,29 @@ def test_rows_restrict_like_subsetting():
     train = (adata.obs["split"] == "train").to_numpy()
     eager, _ = _a2d()(adata[train].copy())  # s3 is all val: subsetting drops it, so neither has its window
     _assert_same(eager, ann2data.LazyCategoryData(adata, _a2d(), rows=train))
+
+
+def test_write_grouped_matches_an_in_memory_reorder(tmp_path):
+    pytest.importorskip("scfit.data")
+    from anndata.acc import A
+
+    from geome.io import write_grouped
+
+    adata = _adata(n=500)
+    adata.layers["dense"] = adata.X.toarray()
+    adata.write_zarr(tmp_path / "src.zarr")
+    order = write_grouped(
+        tmp_path / "src.zarr",
+        tmp_path / "out.zarr",
+        groupby=["sample"],
+        reps=(A.X, A.layers["dense"], A.obsm["spatial"]),
+        n_obs_per_chunk=16,
+        shard_bytes=2_000,  # many small shards and blocks
+    )
+    want = adata[np.argsort(adata.obs["sample"].cat.codes.to_numpy(), kind="stable")]
+    got = ad.read_zarr(tmp_path / "out.zarr")
+    np.testing.assert_array_equal(order, np.argsort(adata.obs["sample"].cat.codes.to_numpy(), kind="stable"))
+    assert list(got.obs_names) == list(want.obs_names)
+    np.testing.assert_array_equal(got.X.toarray(), want.X.toarray())
+    np.testing.assert_array_equal(got.layers["dense"], want.layers["dense"])
+    np.testing.assert_array_equal(got.obsm["spatial"], want.obsm["spatial"])
