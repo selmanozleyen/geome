@@ -56,9 +56,11 @@ def _copy_sparse(x, group, name, order, chunk_rows: int, shard_bytes: int, gap: 
     blosc = (BloscCodec(cname="lz4", clevel=3, shuffle="shuffle"),)
     arrays = {}
     for key, dtype in (("data", x.dtype), ("indices", x.group["indices"].dtype)):
+        # a shard holds whole chunks; it may reach past the end of the array, zarr writes the edge partially
         shard = max(chunk, shard_bytes // np.dtype(dtype).itemsize // chunk * chunk)
-        arrays[key] = g.create_array(key, shape=(nnz,), dtype=dtype, chunks=(min(chunk, max(nnz, 1)),),
-                                     shards=(min(shard, max(nnz, 1)),), compressors=blosc)  # fmt: skip
+        arrays[key] = g.create_array(
+            key, shape=(nnz,), dtype=dtype, chunks=(chunk,), shards=(shard,), compressors=blosc
+        )
     g.create_array("indptr", data=new_indptr)
     # ponytail: blocks end on row boundaries, not shard boundaries, so each block rewrites at most two partial
     # shards; align blocks to shards if that shows up in the write time
@@ -74,8 +76,8 @@ def _copy_sparse(x, group, name, order, chunk_rows: int, shard_bytes: int, gap: 
 def _copy_dense(x, group, name, order, chunk_rows: int, shard_bytes: int, gap: int, batch_size: int | None):
     n, rest = x.shape[0], tuple(x.shape[1:])
     row_bytes = max(1, int(np.prod(rest, dtype=np.int64)) * np.dtype(x.dtype).itemsize)
-    chunk = min(chunk_rows, max(n, 1))
-    shard = min(max(chunk, shard_bytes // row_bytes // chunk * chunk), max(n, 1))
+    chunk = max(1, chunk_rows)
+    shard = max(chunk, shard_bytes // row_bytes // chunk * chunk)  # whole chunks, as for sparse
     out = group.create_array(name, shape=x.shape, dtype=x.dtype, chunks=(chunk, *rest), shards=(shard, *rest),
                              compressors=(BloscCodec(cname="lz4", clevel=3, shuffle="shuffle"),))  # fmt: skip
     out.attrs.update({"encoding-type": "array", "encoding-version": "0.2.0"})
@@ -122,3 +124,4 @@ def write_permuted(
         x = ref.get(backed)
         copy = _copy_sparse if hasattr(x, "group") and "indptr" in x.group else _copy_dense
         copy(x, group, name, order, n_obs_per_chunk, shard_bytes, max_gap, batch_size)
+    zarr.consolidate_metadata(out)  # write_zarr consolidated before the reps existed; readers trusting it miss them

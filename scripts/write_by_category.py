@@ -1,14 +1,11 @@
 """Reorder a zarr store by obs categories, out of core, and write it sharded with annbatch: how long, how much memory.
 
-    python scripts/write_by_category.py SRC.zarr OUT.zarr --groupby domain --mode lazy
-    python scripts/write_by_category.py SRC.zarr OUT.zarr --groupby domain --mode custom
+    python scripts/write_by_category.py SRC.zarr OUT.zarr --groupby domain
 
-Modes:
-
-- ``custom``: :func:`geome.io.write_permuted` with the grouped order: ``obs`` read eagerly, arrays opened with :func:`scfit.data.open_adata` and
-  streamed into place in shard-sized blocks, in one global stable order by ``--groupby``.
-- ``lazy``: :func:`anndata.experimental.read_lazy` (dask), the same order, then :func:`annbatch.io.write_sharded` on the
-  lazy, reordered view: the dask baseline.
+The rewrite is :func:`geome.io.write_permuted` with the grouped order: ``obs`` read eagerly, arrays opened with
+:func:`scfit.data.open_adata` and streamed into place in shard-sized batches. (A dask baseline, ``read_lazy`` plus
+annbatch's ``write_sharded``, does not run: ``write_sharded`` reads ``nnz`` off the sparse matrix, which a lazy dask
+view does not have.)
 
 Then the result is opened with :func:`scfit.data.open_adata` and checked: every category one contiguous run of rows,
 and the rows of one category equal to the source's.
@@ -39,26 +36,15 @@ def stable_order(obs: pd.DataFrame, groupby: list[str]) -> np.ndarray:
     return obs[groupby].reset_index(drop=True).sort_values(groupby, kind="stable").index.to_numpy()
 
 
-def write_lazy(src: str, out: str, groupby: list[str], args) -> ad.AnnData:
-    from annbatch.io import write_sharded
-
-    adata = ad.experimental.read_lazy(src)
-    adata.obs, adata.var = adata.obs.to_memory(), adata.var.to_memory()  # small; X / obsm stay dask
-    adata = adata[stable_order(adata.obs, groupby)]
-    write_sharded(
-        zarr.open_group(out, mode="w"), adata, n_obs_per_chunk=args.n_obs_per_chunk, shard_size=args.shard_size
-    )
-    return adata
-
-
 def write_custom(src: str, out: str, groupby: list[str], args) -> None:
     from anndata.acc import A
 
     from geome.io import write_permuted
 
     obs = ad.io.read_elem(zarr.open_group(src, mode="r")["obs"])
+    order = stable_order(obs, groupby) if args.order == "grouped" else np.random.default_rng(0).permutation(len(obs))
     reps = (A.X, A.obsm["spatial"])
-    write_permuted(src, out, stable_order(obs, groupby), reps=reps, n_obs_per_chunk=args.n_obs_per_chunk)
+    write_permuted(src, out, order, reps=reps, n_obs_per_chunk=args.n_obs_per_chunk)
 
 
 def check(src: str, out: str, groupby: list[str]) -> dict:
@@ -89,7 +75,7 @@ def main() -> None:
     p.add_argument("src")
     p.add_argument("out")
     p.add_argument("--groupby", nargs="+", required=True)
-    p.add_argument("--mode", choices=["custom", "lazy"], default="custom")
+    p.add_argument("--order", choices=["grouped", "shuffled"], default="grouped", help="shuffled: the worst case")
     p.add_argument("--n-obs-per-chunk", type=int, default=64)
     p.add_argument("--shard-size", default="1GB")
     p.add_argument("--no-check", action="store_true")
@@ -97,15 +83,12 @@ def main() -> None:
 
     shutil.rmtree(args.out, ignore_errors=True)
     t0 = time.perf_counter()
-    if args.mode == "lazy":
-        write_lazy(args.src, args.out, args.groupby, args)
-    else:
-        write_custom(args.src, args.out, args.groupby, args)
-    result = {"mode": args.mode, "groupby": args.groupby, "write_seconds": time.perf_counter() - t0}
+    write_custom(args.src, args.out, args.groupby, args)
+    result = {"order": args.order, "groupby": args.groupby, "write_seconds": time.perf_counter() - t0}
     result["peak_rss_gb_write"] = peak_rss_gb()
-    if not args.no_check:
-        result.update(check(args.src, args.out, args.groupby))
-    print(json.dumps(result), flush=True)
+    print(json.dumps(result), flush=True)  # the timing stands even if the check below fails
+    if not args.no_check and args.order == "grouped":
+        print(json.dumps(check(args.src, args.out, args.groupby)), flush=True)
 
 
 if __name__ == "__main__":
