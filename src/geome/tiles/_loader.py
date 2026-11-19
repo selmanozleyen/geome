@@ -112,6 +112,7 @@ class TileLoader:
         self.n_hops = n_hops
         self.n_obs = coords.shape[0]
         self._x = rep.get(adata)
+        self.n_vars = int(self._x.shape[1])
         self._shuffle = shuffle
         self._structures: dict[int, dict[str, torch.Tensor]] = {}
         self._rng = np.random.default_rng(seed)
