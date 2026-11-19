@@ -28,8 +28,8 @@ class LazyCategoryData(Dataset):
     a2d
         A converter whose ``adata2iter`` is a :class:`~geome.iterables.ToCategoryIterator`.
     rows
-        Restrict to these rows (e.g. one split), as a boolean mask over ``adata``'s cells; categories with no rows
-        left stay, empty, as with ``a2d(adata[rows])``.
+        Restrict to these rows (e.g. one split), as a boolean mask over ``adata``'s cells. Categories with no rows
+        left are skipped, as ``a2d(adata[rows])`` skips them.
     """
 
     def __init__(self, adata: AnnData, a2d: Ann2DataAbstract, rows: np.ndarray | None = None) -> None:
@@ -40,9 +40,10 @@ class LazyCategoryData(Dataset):
             adata = a2d._preprocess(adata)
         col = adata.obs[it.category]
         keep = np.ones(adata.n_obs, dtype=bool) if rows is None else np.asarray(rows, dtype=bool)
-        self.rows = [np.flatnonzero((col == c).to_numpy() & keep) for c in col.cat.categories]
-        self._preserved = {
-            k: adata.obs[k].cat.categories
+        # `adata[rows]` drops categories left without cells, so `a2d(adata[rows])` has no empty windows either
+        self.rows = [r for c in col.cat.categories if (r := np.flatnonzero((col == c).to_numpy() & keep)).size]
+        self._preserved = {  # the categories `adata[rows]` would still carry
+            k: adata.obs[k][keep].cat.remove_unused_categories().cat.categories
             for k in (it.preserve_categories or [])
             if k in adata.obs and adata.obs[k].dtype.name == "category"
         }

@@ -55,5 +55,5 @@ def test_lazy_windows_equal_eager_windows(tmp_path, backed):
 def test_rows_restrict_like_subsetting():
     adata = _adata()
     train = (adata.obs["split"] == "train").to_numpy()
-    eager, _ = _a2d()(adata[train].copy())  # s3 is all val: an empty window, as eager keeps it
+    eager, _ = _a2d()(adata[train].copy())  # s3 is all val: subsetting drops it, so neither has its window
     _assert_same(eager, ann2data.LazyCategoryData(adata, _a2d(), rows=train))
