@@ -132,3 +132,24 @@ def test_custom_graph_is_used():
     ring = sparse.diags_array([np.ones(299), np.ones(299)], offsets=[1, -1], shape=(300, 300))
     loader = TileLoader(adata, graph=ring, tile_size=100, shuffle=False)
     assert loader.graph.nnz == ring.nnz + 300  # the ring plus self-loops
+
+
+@pytest.mark.parametrize("sparse_x", [False, True])
+def test_scfit_stream_reads_the_same_tiles(sparse_x):
+    """A scfit Loader driven by TileLoader.sampler() yields every tile once, equal to TileLoader.tile()."""
+    scfit_data = pytest.importorskip("scfit.data")
+    from anndata.acc import A
+
+    adata = _slide(sparse_x=sparse_x)
+    tiles = TileLoader(adata, tile_size=300, shuffle=False)
+    stream = scfit_data.Stream("slide", group_by=(), reps=A.X, sampler=tiles.sampler(shuffle=True, seed=1))
+    loader = scfit_data.Loader({"slide": adata}, primary=stream).set_n_iters(len(tiles))
+    seen = []
+    for batch in loader:
+        got = tiles.from_batch(batch["primary"][A.X], batch["rows"]["primary"])
+        i = int(tiles._tile_of[got.rows[got.core_mask][0]])
+        want = tiles.tile(i)
+        torch.testing.assert_close(got.x, want.x)
+        torch.testing.assert_close(got.edge_index, want.edge_index)
+        seen.append(i)
+    assert sorted(seen) == list(range(len(tiles)))

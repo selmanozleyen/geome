@@ -42,7 +42,8 @@ dependencies = [
 # geome.tiles: out-of-core tiles. anndata.acc references and scfit's backed opener (scfit PR #31, not released yet).
 optional-dependencies.tiles = [
   "anndata>=0.13",
-  "scfit @ git+https://github.com/selmanozleyen/scfit@feat/open-adata",
+  "annbatch>=0.3.1",
+  "scfit @ git+https://github.com/selmanozleyen/scfit@feat/stream-sampler",
 ]
 urls.Documentation = "https://geome.readthedocs.io/"
 urls.Homepage = "https://github.com/theislab/geome"

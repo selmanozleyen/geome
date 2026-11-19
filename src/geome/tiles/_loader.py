@@ -7,12 +7,13 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 import torch
+from annbatch.abc import Sampler
 from anndata.acc import A, AdRef, LayerAcc, MultiAcc
 from torch_geometric.data import Data
 
 from ._graph import expand, gcn_normalize, morton_order, spatial_graph
 
-__all__ = ["TileLoader", "write_sorted"]
+__all__ = ["TileLoader", "TileSampler", "write_sorted"]
 
 Rep = LayerAcc | MultiAcc  # a whole array: A.X, A.layers[k] or A.obsm[k]
 
@@ -115,6 +116,7 @@ class TileLoader:
         self.n_vars = int(self._x.shape[1])
         self._shuffle = shuffle
         self._structures: dict[int, dict[str, torch.Tensor]] = {}
+        self._tile_of: np.ndarray | None = None
         self._rng = np.random.default_rng(seed)
 
     @classmethod
@@ -160,3 +162,61 @@ class TileLoader:
         """Tile ``i`` with its margin: ``x``, ``edge_index``, ``edge_weight``, ``core_mask`` and global ``rows``."""
         s = self._structure(i)
         return Data(x=torch.from_numpy(_read_rows(self._x, s["rows"].numpy())), **s)
+
+    def sampler(self, *, shuffle: bool = False, seed: int = 0) -> TileSampler:
+        """An annbatch sampler reading one tile plus its margin per batch, for :class:`scfit.data.Stream`'s ``sampler``.
+
+        Reading then goes through annbatch (async zarr, optionally a GPU read window); :meth:`from_batch` turns each
+        batch back into this tile's :class:`~torch_geometric.data.Data`.
+        """
+        return TileSampler([self._core_first(i) for i in range(len(self.tiles))], shuffle=shuffle, seed=seed)
+
+    def _core_first(self, i: int) -> np.ndarray:
+        s = self._structure(i)
+        rows, core = s["rows"].numpy(), s["core_mask"].numpy()
+        return np.concatenate([rows[core], rows[~core]])
+
+    def from_batch(self, x, rows: np.ndarray) -> Data:
+        """The tile a :meth:`sampler` batch read: its rep ``x`` and ``rows``, in the order the sampler asked for them.
+
+        With :class:`scfit.data.Loader` these are ``batch["primary"][rep]`` and ``batch["rows"]["primary"]``.
+        """
+        if self._tile_of is None:
+            self._tile_of = np.empty(self.n_obs, dtype=np.int64)
+            for i, core in enumerate(self.tiles):
+                self._tile_of[core] = i
+        s = self._structure(int(self._tile_of[rows[0]]))  # rows come core first
+        x = x.toarray() if hasattr(x, "toarray") else np.asarray(x)
+        order = np.argsort(rows, kind="stable")  # into the tile's sorted row order
+        return Data(x=torch.from_numpy(x[order].astype(np.float32, copy=False)), **s)
+
+
+class TileSampler(Sampler):
+    """One batch per tile: its core rows, then its margin rows, as one explicit annbatch load request."""
+
+    def __init__(self, rows: list[np.ndarray], *, shuffle: bool = False, seed: int = 0) -> None:
+        self._rows = rows
+        self._shuffle = shuffle
+        self._rng = np.random.default_rng(seed)
+
+    @property
+    def batch_size(self) -> None:
+        return None
+
+    @property
+    def shuffle(self) -> bool:
+        return self._shuffle
+
+    def n_batches(self, n_obs: int) -> int:
+        return len(self._rows)
+
+    def validate(self, n_obs: int) -> None:
+        top = max(int(r.max()) for r in self._rows)
+        if top >= n_obs:
+            raise ValueError(f"tiles reach row {top}, but the data has {n_obs} rows.")
+
+    def _sample(self, n_obs: int) -> Iterator[dict]:
+        order = self._rng.permutation(len(self._rows)) if self._shuffle else range(len(self._rows))
+        for i in order:
+            rows = self._rows[i]
+            yield {"requests": rows, "splits": [np.arange(rows.size)]}
